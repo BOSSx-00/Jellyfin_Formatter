@@ -31,21 +31,20 @@ Run it again the same way any time.
 
 The first menu:
 
-- **Rename Movies / Rename TV Shows / Rename Both** — point it at your media
+- **Rename Movies / Rename TV Shows / Rename Both**. Point it at your media
   folder, choose which tags to add back, then review the list of renames.
   Nothing changes until you confirm. Every run is written to `rename-log.txt`.
-- **Put stray files in folders** — finds video files sitting loose with no
+- **Put stray files in folders**. Finds video files sitting loose with no
   folder and wraps each one: `moviefile.ext` becomes
   `Movie Name (Year)/Movie Name (Year) [BOSSx].ext`.
-
-- **Find duplicates** — groups files that look like the same movie or episode
+- **Find duplicates**. Groups files that look like the same movie or episode
   and shows each with its resolution, date and size. Check the copies you want
   gone, then move them to a `_Duplicates` folder or delete them (Recycle Bin on
   Windows). It confirms before either.
-- **Create season.nfo** — writes a small `season.nfo` into a season folder so
+- **Create season.nfo**. Writes a small `season.nfo` into a season folder so
   Jellyfin shows a custom season name (like "Saiyan Saga"). It does not rename
   the folder.
-- **Undo a previous run** — reverses a past rename run, or a "Find duplicates"
+- **Undo a previous run**. Reverses a past rename run, or a "Find duplicates"
   run where you moved copies to a `_Duplicates` folder. Also `--undo`.
 
 `node BOSSx_Jellyfin_Formatter.js --version` prints the version and exits.
