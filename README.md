@@ -62,6 +62,11 @@ The first menu:
 - Multi part movies (`CD1` / `CD2`, `part1` / `part2`) keep their part number and
   share one folder, so Jellyfin plays them as a single movie.
 - Bonus content is left alone (`Extras`, `Specials`, `-trailer` files and the like).
+- A file that another program has open (still seeding in a torrent client, playing
+  in a media player, mid virus scan) can fail to rename. The tool retries a few
+  times for a brief lock, then skips the file and moves on if it is still busy.
+  Stop seeding it or close whatever has it open, then run the tool again over
+  that folder.
 - Your default path and tag choices are saved in `config.json` next to the script.
 - Check the naming logic without touching files: `node BOSSx_Jellyfin_Formatter.js --selftest`.
 

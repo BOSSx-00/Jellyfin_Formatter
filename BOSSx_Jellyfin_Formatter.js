@@ -33,7 +33,7 @@ const linkText = (t) => `\x1b[38;2;162;0;0m\x1b[4m${t}\x1b[0m`;
 
 // Bump this on every change and add a matching entry to CHANGELOG.md.
 // Shown in grey under the title art.
-const VERSION = '1.10.0-beta';
+const VERSION = '1.10.1-beta';
 
 // A row of key hints:  ↑/↓ = MOVE     │     Enter = SELECT     │     Ctrl+C = EXIT
 function keyHints(pairs) {
@@ -1882,6 +1882,30 @@ async function reviewPlan(plan, root, warned) {
   return reviewed.filter((x) => x.checked).map((x) => x._plan);
 }
 
+// Pause the calling thread without spinning the CPU. Node has no sync sleep
+// built in; blocking on Atomics.wait against a throwaway buffer is the usual way.
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// A file can be briefly locked by something else touching the library (a
+// Jellyfin scan, a player, a virus scanner, a cloud sync client), which shows
+// up as EBUSY/EPERM/EACCES on the rename. Most of those clear in well under a
+// second, so retry a handful of times with a short backoff before giving up.
+function renameWithRetry(from, to) {
+  const attempts = 5;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      fs.renameSync(from, to);
+      return;
+    } catch (err) {
+      const retryable = err.code === 'EBUSY' || err.code === 'EPERM' || err.code === 'EACCES';
+      if (!retryable || i === attempts - 1) throw err;
+      sleepSync(200 * (i + 1));
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Execute
 // ---------------------------------------------------------------------------
@@ -1918,7 +1942,7 @@ function executeMoves(list, opts) {
         continue;
       }
       fs.mkdirSync(path.dirname(it.to), { recursive: true });
-      fs.renameSync(it.from, it.to);
+      renameWithRetry(it.from, it.to);
       console.log(green('  OK    ') + shortFrom + gray('  ->  ') + path.basename(it.to));
       ok++;
       logLines.push(logEntry(okWord, it.from, it.to));

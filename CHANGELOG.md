@@ -5,6 +5,15 @@ semantic versioning: a new feature bumps the minor number, a fix bumps the
 patch number. The `1.0.x` entries below were the initial build-out, where every
 change was a patch bump.
 
+## 1.10.1-beta
+
+- A file that is briefly locked by something else (Jellyfin scanning the
+  library, a player with it open, a virus scanner, a cloud sync client) used
+  to fail the rename right away with an `EBUSY` / `EPERM` error. It now
+  retries a few times with a short pause before giving up, since most locks
+  like that clear on their own in under a second. If it still fails, it is
+  skipped and logged exactly as before, and the rest of the batch keeps going.
+
 ## 1.10.0-beta
 
 - Multi-part (stacked) movies are kept together. A file that ends in `CD1`,
