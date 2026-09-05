@@ -5,6 +5,12 @@ semantic versioning: a new feature bumps the minor number, a fix bumps the
 patch number. The `1.0.x` entries below were the initial build-out, where every
 change was a patch bump.
 
+## 1.10.2-beta
+
+- If a file is still locked after the retries in 1.10.1, the error now says so
+  in plain terms: pause any torrent seeding it and close any media player or
+  app that has it open, then run the tool again.
+
 ## 1.10.1-beta
 
 - A file that is briefly locked by something else (Jellyfin scanning the

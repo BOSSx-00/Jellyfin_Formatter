@@ -33,7 +33,7 @@ const linkText = (t) => `\x1b[38;2;162;0;0m\x1b[4m${t}\x1b[0m`;
 
 // Bump this on every change and add a matching entry to CHANGELOG.md.
 // Shown in grey under the title art.
-const VERSION = '1.10.1-beta';
+const VERSION = '1.10.2-beta';
 
 // A row of key hints:  ↑/↓ = MOVE     │     Enter = SELECT     │     Ctrl+C = EXIT
 function keyHints(pairs) {
@@ -1900,7 +1900,13 @@ function renameWithRetry(from, to) {
       return;
     } catch (err) {
       const retryable = err.code === 'EBUSY' || err.code === 'EPERM' || err.code === 'EACCES';
-      if (!retryable || i === attempts - 1) throw err;
+      if (!retryable) throw err;
+      if (i === attempts - 1) {
+        throw new Error(
+          `still locked after retrying (${err.code}). Pause any torrent seeding ` +
+          'this file and close any media player or app that has it open, then run the tool again.'
+        );
+      }
       sleepSync(200 * (i + 1));
     }
   }
