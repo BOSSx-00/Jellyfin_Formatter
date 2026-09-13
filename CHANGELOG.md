@@ -5,6 +5,39 @@ semantic versioning: a new feature bumps the minor number, a fix bumps the
 patch number. The `1.0.x` entries below were the initial build-out, where every
 change was a patch bump.
 
+## 1.11.0-beta
+
+- New menu option **Rename Subtitles**. Finds subtitle files (`.srt`, `.ass`,
+  `.ssa`, `.vtt`, `.sub`/`.idx`, `.sup`, `.smi`, `.ttml`) and renames each to
+  match the video it sits with, so Jellyfin pairs them correctly. A language,
+  forced or SDH tag already in the name (`English`, `en`, `eng`, `forced`,
+  `HI`, `CC`, ...) is kept and normalized to Jellyfin's own tag spelling
+  (`.en.forced.srt`, `.en.sdh.srt`). A subtitle renamed this way always
+  targets its video's *current* on disk name, not a hypothetical future one,
+  so the pairing is correct right away even if that video is never renamed;
+  if it later is, the existing sidecar-follows-video logic picks it up too.
+  A subtitle with no video in its folder is still cleaned up on its own
+  through the normal title/episode formatter, flagged as unmatched in the
+  review list. Undoable, same as a regular rename.
+- New menu option **Missing Subtitles**. Lists every movie or episode with no
+  subtitle: no external file next to it, and for `.mkv`, no subtitle track
+  muxed inside the file either (read straight from the Matroska container,
+  no external tool, so a huge file only costs a handful of small reads).
+  Read only, can save the list to a text file. `.mkv` files it could not
+  parse are listed separately rather than assumed to have no subtitle.
+- New menu option **Create movie.nfo**. Same idea as Create season.nfo:
+  point it at a movie folder and it writes a `movie.nfo` Jellyfin reads
+  before checking online. Title, year, plot, genres, content rating, IMDb ID
+  and TMDb ID, using the exact tag names Jellyfin's own metadata saver
+  produces. Everything but the title is optional and only written when given
+  a value. Title and year are guessed from the folder name to start from.
+- The main menu now shows a one line description of whatever option is
+  currently highlighted, under the list and above the key hints.
+- Renamed menu options for clarity: **Put stray files in folders** ->
+  **Folderize Stray Files**, **Find duplicates** -> **Find Duplicates**,
+  **Rename Both** -> **Rename Movies & TV Shows**, **Undo a previous run**
+  -> **Undo Changes**.
+
 ## 1.10.2-beta
 
 - If a file is still locked after the retries in 1.10.1, the error now says so

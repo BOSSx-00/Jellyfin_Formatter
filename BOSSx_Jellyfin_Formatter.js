@@ -3,8 +3,9 @@
 
 /*
  * BOSSx - Jellyfin Formatter
- * A toolkit for a movie and TV library: rename to Jellyfin standards, give
- * stray files a folder, find duplicates, write custom season names, undo runs.
+ * A toolkit for a movie and TV library: rename movies, TV shows and subtitles
+ * to Jellyfin standards, give stray files a folder, find duplicates, find
+ * videos with no subtitle, write custom season/movie metadata, undo runs.
  * Plain Node.js, built-in modules only, no packages to install.
  *
  * Run:  node BOSSx_Jellyfin_Formatter.js
@@ -33,7 +34,7 @@ const linkText = (t) => `\x1b[38;2;162;0;0m\x1b[4m${t}\x1b[0m`;
 
 // Bump this on every change and add a matching entry to CHANGELOG.md.
 // Shown in grey under the title art.
-const VERSION = '1.10.2-beta';
+const VERSION = '1.11.0-beta';
 
 // A row of key hints:  ↑/↓ = MOVE     │     Enter = SELECT     │     Ctrl+C = EXIT
 function keyHints(pairs) {
@@ -991,6 +992,372 @@ function unifyShowFolders(plan) {
 }
 
 // ---------------------------------------------------------------------------
+// Subtitles
+// ---------------------------------------------------------------------------
+// Text and image based subtitle formats. Excludes .nfo (SIDECAR_EXT's other
+// member), that one is metadata, not a subtitle, and is never renamed.
+const SUBTITLE_EXT = new Set([
+  '.srt', '.ass', '.ssa', '.vtt', '.sub', '.idx', '.sup', '.smi', '.ttml',
+]);
+
+// Language name or code, in a subtitle's own filename, mapped to the 2 letter
+// code Jellyfin's docs show first (jellyfin.org/docs/general/server/metadata/
+// nfo lists both 2 and 3 letter forms as valid; 2 letter is what gets written
+// back out no matter which form was found). Deliberately leaves out a few real
+// ISO codes ("is" Icelandic, "in" Indonesian's old code) that are also common
+// English words, since those would misfire far more than they would ever help.
+const LANGUAGE_MAP = {
+  english: 'en', eng: 'en', en: 'en',
+  spanish: 'es', espanol: 'es', 'español': 'es', spa: 'es', es: 'es', castellano: 'es', latam: 'es',
+  french: 'fr', francais: 'fr', 'français': 'fr', fre: 'fr', fra: 'fr', fr: 'fr', vff: 'fr',
+  german: 'de', deutsch: 'de', ger: 'de', deu: 'de', de: 'de',
+  italian: 'it', italiano: 'it', ita: 'it', it: 'it',
+  portuguese: 'pt', portugues: 'pt', 'português': 'pt', por: 'pt', pt: 'pt',
+  brazilian: 'pt-BR', ptbr: 'pt-BR',
+  russian: 'ru', rus: 'ru', ru: 'ru',
+  japanese: 'ja', jpn: 'ja', jap: 'ja', ja: 'ja',
+  korean: 'ko', kor: 'ko', ko: 'ko',
+  chinese: 'zh', mandarin: 'zh', cantonese: 'zh', chi: 'zh', zho: 'zh', zh: 'zh', chs: 'zh', cht: 'zh',
+  arabic: 'ar', ara: 'ar', ar: 'ar',
+  dutch: 'nl', nederlands: 'nl', nld: 'nl', dut: 'nl', nl: 'nl',
+  polish: 'pl', polski: 'pl', pol: 'pl', pl: 'pl',
+  turkish: 'tr', turkce: 'tr', tur: 'tr', tr: 'tr',
+  swedish: 'sv', svenska: 'sv', swe: 'sv', sv: 'sv',
+  norwegian: 'no', norsk: 'no', nor: 'no', no: 'no',
+  danish: 'da', dansk: 'da', dan: 'da', da: 'da',
+  finnish: 'fi', suomi: 'fi', fin: 'fi', fi: 'fi',
+  greek: 'el', gre: 'el', ell: 'el', el: 'el',
+  hebrew: 'he', heb: 'he', he: 'he',
+  hindi: 'hi', hin: 'hi',
+  thai: 'th', tha: 'th', th: 'th',
+  vietnamese: 'vi', vie: 'vi', vi: 'vi',
+  indonesian: 'id', ind: 'id', id: 'id',
+  czech: 'cs', cesky: 'cs', cze: 'cs', ces: 'cs', cs: 'cs',
+  hungarian: 'hu', magyar: 'hu', hun: 'hu', hu: 'hu',
+  romanian: 'ro', rum: 'ro', ron: 'ro', ro: 'ro',
+  ukrainian: 'uk', ukr: 'uk', uk: 'uk',
+};
+
+// Flags that ride along with a subtitle's language ("Movie.en.forced.srt"),
+// normalized to Jellyfin's own tag spelling. "hi" (hearing impaired) and "cc"
+// (closed captions) both mean the same thing as Jellyfin's "sdh" tag.
+const SUBTITLE_FLAG_TOKENS = new Set(['forced', 'sdh', 'cc', 'hi', 'default']);
+
+// Peels recognized language and flag tokens off the END of a subtitle's base
+// name (language once, flags any number of times, in either order), so
+// "Movie.Name.2020.forced.en" and "Movie.Name.2020.en.forced" both yield
+// { lang: 'en', flags: { forced: true, ... }, rest: 'Movie Name 2020' }.
+// Stops at the first token that is neither, so a real title is never eaten.
+function parseSubtitleSuffix(stem) {
+  const tokens = stem.split(/[ ._-]+/).filter(Boolean);
+  let lang = null;
+  const flags = { forced: false, sdh: false, default: false };
+  let consumed = 0;
+  for (let i = tokens.length - 1; i >= 0; i--) {
+    const t = tokens[i].toLowerCase();
+    if (SUBTITLE_FLAG_TOKENS.has(t)) {
+      flags[t === 'cc' || t === 'hi' ? 'sdh' : t] = true;
+      consumed++;
+      continue;
+    }
+    if (lang === null && Object.prototype.hasOwnProperty.call(LANGUAGE_MAP, t)) {
+      lang = LANGUAGE_MAP[t];
+      consumed++;
+      continue;
+    }
+    break;
+  }
+  return { lang, flags, rest: tokens.slice(0, tokens.length - consumed).join(' ') };
+}
+
+function subtitleSuffixString(lang, flags) {
+  let s = '';
+  if (lang) s += '.' + lang;
+  if (flags.forced) s += '.forced';
+  if (flags.sdh) s += '.sdh';
+  if (flags.default) s += '.default';
+  return s;
+}
+
+// Same walk as the video only one, but collects subtitle files too so a
+// single scan can match them up.
+function walkAll(dir, videoAcc, subAcc) {
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch (err) {
+    return;
+  }
+  for (const ent of entries) {
+    const full = path.join(dir, ent.name);
+    if (ent.isDirectory()) {
+      const low = ent.name.toLowerCase();
+      if (SKIP_DIRS.has(low) || low.startsWith('.')) continue;
+      walkAll(full, videoAcc, subAcc);
+    } else if (ent.isFile()) {
+      const ext = path.extname(ent.name).toLowerCase();
+      if (VIDEO_EXT.has(ext)) videoAcc.push(full);
+      else if (SUBTITLE_EXT.has(ext)) subAcc.push(full);
+    }
+  }
+}
+
+// Picks which video (of possibly several in the same folder) a subtitle
+// belongs to: the only one there, the one with a matching episode number, a
+// matching multi-part number, or one it already shares a stem prefix with.
+// `rest` is the subtitle's base name with any language/forced/sdh tag already
+// peeled off, needed for the part-number check since that marker only counts
+// when it is the last thing in the name (a trailing ".English" would hide it
+// otherwise). Returns null rather than guess when nothing lines up.
+function pickMatchingVideo(rawBase, rest, candidates) {
+  if (!candidates.length) return null;
+  if (candidates.length === 1) return candidates[0];
+
+  const subEp = matchEpisode(preClean(rawBase), true);
+  if (subEp) {
+    const hit = candidates.find((v) => {
+      const ep = matchEpisode(preClean(path.basename(v, path.extname(v))), true);
+      return ep && ep.season === subEp.season && ep.episode === subEp.episode;
+    });
+    if (hit) return hit;
+  }
+
+  const subPart = moviePartNumber(rest);
+  if (subPart != null) {
+    const hit = candidates.find((v) =>
+      moviePartNumber(path.basename(v, path.extname(v))) === subPart);
+    if (hit) return hit;
+  }
+
+  const rawLc = rawBase.toLowerCase();
+  return candidates.find((v) => {
+    const vStem = path.basename(v, path.extname(v)).toLowerCase();
+    return rawLc === vStem || rawLc.startsWith(vStem + '.') || rawLc.startsWith(vStem + ' ');
+  }) || null;
+}
+
+// Builds the rename for one subtitle file. A matched subtitle always targets
+// the video's CURRENT on disk name, not a hypothetical future one, so pairing
+// is correct right now regardless of whether that video ever gets renamed (if
+// it later is, the existing sidecar-follows-video logic picks this file up
+// too, since by then its stem matches exactly). An unmatched subtitle, one
+// with no video sharing its folder, is still cleaned up on its own through
+// the normal title/episode formatter and flagged as unmatched in the review.
+function buildSubtitleRename(subPath, root, videosByDir, opts) {
+  const ext = path.extname(subPath);
+  const dir = path.dirname(subPath);
+  const rawBase = path.basename(subPath, ext);
+  const { lang, flags, rest } = parseSubtitleSuffix(rawBase);
+  const suffix = subtitleSuffixString(lang, flags);
+
+  const candidates = videosByDir.get(dir) || [];
+  const matchedVideo = pickMatchingVideo(rawBase, rest, candidates);
+
+  let newBase;
+  if (matchedVideo) {
+    newBase = path.basename(matchedVideo, path.extname(matchedVideo));
+  } else {
+    const anchor = anchorFor(subPath, root);
+    const parentName = path.basename(dir);
+    const inOwnFolder = !samePath(dir, root) && !isLibraryDir(dir);
+    const isTV = looksLikeTV(rest) || looksLikeTV(subPath) || seasonFromDir(subPath, root) != null;
+    const showHint = isTV ? (path.relative(anchor, dir).split(/[\\/]+/)[0] || '') : '';
+    const seasonHint = isTV ? seasonFromDir(subPath, root) : null;
+    const movieFolderHint = (!isTV && inOwnFolder && !isRebuildableDir(parentName) &&
+      pickYear(preClean(parentName))) ? parentName : '';
+
+    const formatted = isTV
+      ? formatTV(rest, ext, subPath, BARE_OPTS, showHint, seasonHint, true)
+      : formatMovie(rest, ext, subPath, BARE_OPTS, movieFolderHint);
+    if (!formatted) return null;
+    newBase = path.basename(formatted.relPath, ext);
+  }
+
+  const newPath = path.join(dir, newBase + suffix + ext);
+  if (samePath(newPath, subPath)) return null;
+
+  return {
+    oldPath: subPath,
+    newPath,
+    matched: !!matchedVideo,
+    lang: lang || '',
+    relOld: path.relative(root, subPath) || path.basename(subPath),
+    relNew: path.relative(root, newPath) || path.basename(newPath),
+  };
+}
+
+// External subtitle sitting next to the video, any language, any of the
+// supported extensions. Mirrors findSidecars' own stem matching rule.
+function hasExternalSubtitle(videoPath) {
+  const dir = path.dirname(videoPath);
+  const vName = path.basename(videoPath);
+  const stemLc = path.basename(videoPath, path.extname(videoPath)).toLowerCase();
+  let entries;
+  try {
+    entries = fs.readdirSync(dir);
+  } catch (err) {
+    return false;
+  }
+  return entries.some((name) => {
+    if (name === vName) return false;
+    const ext = path.extname(name).toLowerCase();
+    if (!SUBTITLE_EXT.has(ext)) return false;
+    const noExtLc = name.slice(0, name.length - ext.length).toLowerCase();
+    return noExtLc === stemLc || noExtLc.startsWith(stemLc + '.') || noExtLc.startsWith(stemLc + ' ');
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Minimal MKV (Matroska/EBML) reader, just enough to see whether a file has
+// any subtitle track muxed inside it. No demuxer dependency: element headers
+// are read and jumped over by their declared size, so even a many gigabyte
+// file only costs a handful of small reads near the start.
+// ---------------------------------------------------------------------------
+const EBML_HEADER_ID = 0x1a45dfa3;
+const EBML_IDS = {
+  SEGMENT: 0x18538067,
+  TRACKS: 0x1654ae6b,
+  TRACKENTRY: 0xae,
+  TRACKTYPE: 0x83,
+  LANGUAGE: 0x22b59c,
+  LANGUAGE_IETF: 0x22b59d,
+  CLUSTER: 0x1f43b675,
+};
+const MKV_SUBTITLE_TRACK_TYPE = 0x11;
+
+// Reads one EBML variable length integer at buf[pos]. An element ID keeps its
+// length marker bit(s), they are part of the ID's identity, so pass
+// stripMarker=false. A size field has the marker bit(s) removed from the
+// value, pass stripMarker=true; an all-ones value after that means "unknown
+// size", which Matroska allows for a handful of top level elements.
+function readVint(buf, pos, stripMarker) {
+  if (pos >= buf.length) return null;
+  const first = buf[pos];
+  let len = 0;
+  for (let mask = 0x80; mask > 0; mask >>= 1) {
+    len++;
+    if (first & mask) break;
+    if (mask === 1) return null;
+  }
+  if (pos + len > buf.length) return null;
+  const marker = 0x80 >> (len - 1);
+  let value = stripMarker ? (first & (marker - 1)) : first;
+  let allOnes = stripMarker && (first & (marker - 1)) === (marker - 1);
+  for (let i = 1; i < len; i++) {
+    const b = buf[pos + i];
+    value = value * 256 + b;
+    if (stripMarker && b !== 0xff) allOnes = false;
+  }
+  return { value, length: len, unknown: allOnes };
+}
+
+function readAt(fd, position, length) {
+  const buf = Buffer.alloc(length);
+  const read = fs.readSync(fd, buf, 0, length, position);
+  return buf.subarray(0, read);
+}
+
+// Parses an already isolated Tracks element body and returns the language
+// (falling back to 'und') of every TrackEntry whose TrackType is subtitle.
+function parseTracksElement(buf) {
+  const langs = [];
+  let pos = 0;
+  while (pos < buf.length) {
+    const idV = readVint(buf, pos, false);
+    if (!idV) break;
+    const sizeV = readVint(buf, pos + idV.length, true);
+    if (!sizeV) break;
+    const bodyStart = pos + idV.length + sizeV.length;
+    const bodyLen = sizeV.unknown ? (buf.length - bodyStart) : sizeV.value;
+    const body = buf.subarray(bodyStart, bodyStart + bodyLen);
+
+    if (idV.value === EBML_IDS.TRACKENTRY) {
+      let type = null;
+      let lang = '';
+      let p2 = 0;
+      while (p2 < body.length) {
+        const id2 = readVint(body, p2, false);
+        if (!id2) break;
+        const size2 = readVint(body, p2 + id2.length, true);
+        if (!size2) break;
+        const b2Start = p2 + id2.length + size2.length;
+        const b2Len = size2.unknown ? (body.length - b2Start) : size2.value;
+        const b2 = body.subarray(b2Start, b2Start + b2Len);
+        if (id2.value === EBML_IDS.TRACKTYPE && b2.length) {
+          type = b2[b2.length - 1];
+        } else if (id2.value === EBML_IDS.LANGUAGE_IETF && b2.length) {
+          lang = b2.toString('utf8').trim() || lang;
+        } else if (id2.value === EBML_IDS.LANGUAGE && !lang) {
+          lang = b2.toString('ascii').trim();
+        }
+        p2 = b2Start + b2Len;
+      }
+      if (type === MKV_SUBTITLE_TRACK_TYPE) langs.push(lang || 'und');
+    }
+    pos = bodyStart + bodyLen;
+  }
+  return langs;
+}
+
+// Returns the language of every subtitle track found (an empty array means
+// confirmed none), or null when the file could not be read or understood as
+// Matroska, so the caller can tell "no subtitles" apart from "couldn't check".
+function probeMkvSubtitleTracks(filePath) {
+  let fd;
+  try {
+    fd = fs.openSync(filePath, 'r');
+  } catch (err) {
+    return null;
+  }
+  try {
+    const HEAD = 12; // worst case: a 4 byte ID plus an 8 byte size
+    let pos = 0;
+    let head = readAt(fd, pos, HEAD);
+    const ebmlId = readVint(head, 0, false);
+    if (!ebmlId || ebmlId.value !== EBML_HEADER_ID) return null; // not EBML at all
+    const ebmlSize = readVint(head, ebmlId.length, true);
+    if (!ebmlSize) return null;
+    pos = ebmlId.length + ebmlSize.length + (ebmlSize.unknown ? 0 : ebmlSize.value);
+
+    head = readAt(fd, pos, HEAD);
+    const segId = readVint(head, 0, false);
+    if (!segId || segId.value !== EBML_IDS.SEGMENT) return null;
+    const segSize = readVint(head, segId.length, true);
+    if (!segSize) return null;
+    pos += segId.length + segSize.length;
+    const segEnd = segSize.unknown ? Infinity : pos + segSize.value;
+
+    // Tracks always sits well before this in a properly muxed file (SeekHead,
+    // Info, then Tracks, all tiny, long before the first Cluster of media).
+    const scanEnd = Math.min(segEnd, pos + 200 * 1024 * 1024);
+
+    while (pos < scanEnd) {
+      head = readAt(fd, pos, HEAD);
+      if (!head.length) break;
+      const cid = readVint(head, 0, false);
+      if (!cid) break;
+      const csize = readVint(head, cid.length, true);
+      if (!csize) break;
+      const bodyStart = pos + cid.length + csize.length;
+
+      if (cid.value === EBML_IDS.TRACKS) {
+        if (csize.unknown) return null;
+        const body = readAt(fd, bodyStart, Math.min(csize.value, 8 * 1024 * 1024));
+        return parseTracksElement(body);
+      }
+      if (cid.value === EBML_IDS.CLUSTER) break; // media data starts, Tracks was never seen
+      if (csize.unknown) break; // can't safely skip an element whose size we don't know
+      pos = bodyStart + csize.value;
+    }
+    return null; // Tracks not found in the scanned range, inconclusive
+  } catch (err) {
+    return null;
+  } finally {
+    try { fs.closeSync(fd); } catch (err) { /* already closed */ }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 function loadConfig() {
@@ -1047,7 +1414,7 @@ function parseLog() {
   const runs = [];
   let current = null;
   for (let i = 0; i < lines.length; i++) {
-    const head = lines[i].match(/^===== (Run|Undo|Duplicates) (\d{4}-\d{2}-\d{2}T[0-9:.]+Z) =====$/);
+    const head = lines[i].match(/^===== (Run|Undo|Duplicates|Subtitles) (\d{4}-\d{2}-\d{2}T[0-9:.]+Z) =====$/);
     if (head) {
       current = { label: head[1], ts: head[2], entries: [] };
       runs.push(current);
@@ -1206,20 +1573,28 @@ function isSpace(str, key) {
   return key.name === 'space' || str === ' ';
 }
 
-// Single choice menu, arrow keys plus Enter.
+// Single choice menu, arrow keys plus Enter. An option can be a plain string,
+// or { label, desc } to show a one line description of the highlighted item
+// under the list (used by the main mode menu).
 function selectMenu(title, options) {
   return new Promise((resolve) => {
     let index = 0;
+    const opts = options.map((o) => (typeof o === 'string' ? { label: o, desc: '' } : o));
+    const hasDesc = opts.some((o) => o.desc);
 
     function render() {
       clearScreen();
       printHeader();
       console.log('\n  ' + bold(brand(title)) + '\n');
-      options.forEach((opt, i) => {
+      opts.forEach((opt, i) => {
         const pointer = i === index ? brand('>') : ' ';
-        const label = i === index ? bold(brand(opt)) : opt;
+        const label = i === index ? bold(brand(opt.label)) : opt.label;
         console.log(`   ${pointer} ${label}`);
       });
+      if (hasDesc) {
+        console.log('');
+        console.log('  ' + gray(opts[index].desc || ''));
+      }
       console.log('\n' + keyHints([
         ['↑/↓', 'move'],
         ['Enter', 'select'],
@@ -1230,8 +1605,8 @@ function selectMenu(title, options) {
     function onKey(str, key) {
       key = key || {};
       if (key.ctrl && key.name === 'c') { cleanup(); restoreTerminal(); process.exit(0); }
-      if (key.name === 'up') { index = (index - 1 + options.length) % options.length; render(); }
-      else if (key.name === 'down') { index = (index + 1) % options.length; render(); }
+      if (key.name === 'up') { index = (index - 1 + opts.length) % opts.length; render(); }
+      else if (key.name === 'down') { index = (index + 1) % opts.length; render(); }
       else if (isEnter(key)) { cleanup(); resolve(index); }
     }
 
@@ -1365,8 +1740,9 @@ async function showIntro() {
   clearScreen();
   printHeader();
   console.log('  ' + 'A toolkit for getting a movie and TV library into Jellyfin shape:');
-  console.log('  ' + 'rename files to Jellyfin standards, give stray files a folder, find');
-  console.log('  ' + 'duplicates, write custom season names, and undo any run.');
+  console.log('  ' + 'rename movies, TV shows and subtitles to Jellyfin standards, give');
+  console.log('  ' + 'stray files a folder, find duplicates and missing subtitles, write');
+  console.log('  ' + 'custom season/movie metadata, and undo any run.');
   console.log('  ' + 'More of my tools: ' + linkText('https://BOSSx.ca'));
   console.log('');
   console.log('  ' + yellow('This tool is in beta. Always look over the preview before you confirm,'));
@@ -1382,15 +1758,116 @@ async function showIntro() {
 
 async function chooseMode() {
   const idx = await selectMenu('What do you want to do?', [
-    'Rename Movies',
-    'Rename TV Shows',
-    'Rename Both',
-    'Put stray files in folders',
-    'Find duplicates',
-    'Create season.nfo',
-    'Undo a previous run',
+    { label: 'Rename Movies',
+      desc: 'Scan for movie files and rename them to Jellyfin standards.' },
+    { label: 'Rename TV Shows',
+      desc: 'Scan for TV episodes and rename them to Jellyfin standards.' },
+    { label: 'Rename Movies & TV Shows',
+      desc: 'Scan for both movies and TV episodes in one pass and rename everything found.' },
+    { label: 'Rename Subtitles',
+      desc: 'Match subtitle files to the video they belong with and rename them to pair correctly in Jellyfin.' },
+    { label: 'Folderize Stray Files',
+      desc: 'Give loose video files sitting outside any folder of their own a proper movie/show folder.' },
+    { label: 'Find Duplicates',
+      desc: 'Group files that look like the same movie or episode so you can clear out the extra copies.' },
+    { label: 'Missing Subtitles',
+      desc: 'List every movie or episode with no subtitle file, checking inside .mkv files for embedded tracks too.' },
+    { label: 'Create season.nfo',
+      desc: 'Write a small file that changes only the season name Jellyfin displays, without renaming the folder.' },
+    { label: 'Create movie.nfo',
+      desc: 'Write a movie.nfo with the title, year, plot and other details, so Jellyfin uses it before checking online.' },
+    { label: 'Undo Changes',
+      desc: 'Pick a past run from the log and move the affected files back to how they were.' },
   ]);
-  return ['movies', 'tv', 'both', 'setup', 'dupes', 'nfo', 'undo'][idx];
+  return ['movies', 'tv', 'both', 'subs', 'setup', 'dupes', 'missing-subs', 'nfo-season', 'nfo-movie', 'undo'][idx];
+}
+
+// ---------------------------------------------------------------------------
+// Rename Subtitles
+// ---------------------------------------------------------------------------
+async function renameSubtitles(config) {
+  clearScreen();
+  printHeader();
+  console.log('  ' + bold(brand('Rename Subtitles')) + '\n');
+  console.log('  ' + gray('Finds subtitle files (.srt, .ass, .ssa, .vtt, .sub/.idx, .sup, .smi,'));
+  console.log('  ' + gray('.ttml) and renames each to match the video it sits with, so Jellyfin'));
+  console.log('  ' + gray('pairs them up correctly. A language, forced or SDH tag already in the'));
+  console.log('  ' + gray('name is kept and normalized (English -> en, Forced, SDH). A subtitle'));
+  console.log('  ' + gray('with no video in its folder is still cleaned up on its own, marked'));
+  console.log('  ' + gray('unmatched in the review so you can double check it by hand.'));
+  console.log('');
+
+  const scanPath = await choosePath(config);
+
+  clearScreen();
+  printHeader();
+  process.stdout.write(brand('  Scanning for video and subtitle files ...'));
+  const videos = [];
+  const subs = [];
+  walkAll(scanPath, videos, subs);
+  process.stdout.write('\r' + gray(
+    `  Found ${videos.length} video file(s), ${subs.length} subtitle file(s).            `
+  ) + '\n');
+
+  if (!subs.length) {
+    console.log(green('\n  No subtitle files found.'));
+    process.exit(0);
+  }
+
+  const videosByDir = new Map();
+  for (const v of videos) {
+    const d = path.dirname(v);
+    if (!videosByDir.has(d)) videosByDir.set(d, []);
+    videosByDir.get(d).push(v);
+  }
+
+  const plan = [];
+  for (const s of subs) {
+    const res = buildSubtitleRename(s, scanPath, videosByDir, config.settings);
+    if (res) plan.push(res);
+  }
+
+  if (!plan.length) {
+    console.log(green('\n  Nothing to rename. Every subtitle already matches its video.'));
+    process.exit(0);
+  }
+
+  const unmatched = plan.filter((p) => !p.matched).length;
+  await pause(`${plan.length} subtitle(s) can be renamed` +
+    (unmatched ? `, ${unmatched} with no video match in their folder` : '') +
+    '. Press Enter to review');
+
+  const half = Math.max(16, Math.floor((COLS() - 16) / 2));
+  const items = plan.map((p) => ({
+    checked: true,
+    label: (p.matched ? '' : yellow('? ')) +
+      fit(p.relOld, half) + gray('  ->  ') + green(fit(p.relNew, half)) +
+      (p.matched ? '' : gray('  (no video match, best guess)')),
+    _plan: p,
+  }));
+  const reviewed = await checkboxList(
+    `Review renames   ${plan.length} subtitle(s) found, checked files will be renamed`,
+    items
+  );
+  const selected = reviewed.filter((x) => x.checked).map((x) => x._plan);
+  if (!selected.length) {
+    console.log(yellow('\n  No files selected. Nothing was changed.'));
+    process.exit(0);
+  }
+
+  const confirm = await selectMenu(
+    `Rename ${selected.length} subtitle(s) now? This will rename them on disk.`,
+    ['Yes, rename them', 'No, cancel']
+  );
+  if (confirm !== 0) {
+    console.log(yellow('\n  Cancelled. Nothing was changed.'));
+    process.exit(0);
+  }
+
+  const moves = selected.map((p) => ({ from: p.oldPath, to: p.newPath }));
+  executeMoves(moves, { okWord: 'RENAMED', runLabel: 'Subtitles' });
+  console.log('');
+  process.exit(0);
 }
 
 function xmlEscape(s) {
@@ -1507,6 +1984,143 @@ async function createSeasonNfo() {
   process.exit(0);
 }
 
+// Write a movie.nfo, Jellyfin's own Kodi-compatible local metadata format
+// (jellyfin.org/docs/general/server/metadata/nfo). Fields are optional except
+// the title, only the ones given a value are written, matching the tag names
+// Jellyfin's own saver produces: title, originaltitle, year, plot, genre,
+// mpaa, imdbid, tmdbid.
+async function createMovieNfo() {
+  clearScreen();
+  printHeader();
+  console.log('  ' + bold(brand('Create movie.nfo')) + '\n');
+  console.log('  ' + gray('Drops a movie.nfo into a movie folder with the details you give it.'));
+  console.log('  ' + gray('Jellyfin reads a local .nfo before checking online, so this is the'));
+  console.log('  ' + gray('fastest way to fix a wrong match or fill in a movie with nothing'));
+  console.log('  ' + gray('to find online at all. It does not rename the folder or the file.'));
+  console.log('');
+
+  let dir = '';
+  while (!dir) {
+    const raw = (await promptText('Movie folder path', '')).replace(/^"(.*)"$/, '$1').trim();
+    let isDir = false;
+    try { isDir = !!raw && fs.statSync(raw).isDirectory(); } catch (err) { isDir = false; }
+    if (isDir) {
+      dir = raw;
+    } else if (raw) {
+      console.log(gray('  That folder does not exist. Check the path, or Ctrl+C to quit.'));
+    } else {
+      console.log(gray('  Enter the path to an existing movie folder. Ctrl+C to quit.'));
+    }
+  }
+
+  // Guess the title and year from the folder name, "Title (Year)" style,
+  // the same source of truth formatMovie itself trusts.
+  const folderName = path.basename(dir);
+  const cleanedFolder = preClean(folderName);
+  const guessedYear = pickYear(cleanedFolder);
+  const guessedTitle = titleCase(cleanName(
+    guessedYear ? cleanedFolder.slice(0, guessedYear.index) : cleanedFolder
+  ));
+
+  let title = '';
+  while (!title) {
+    title = (await promptText('Movie title', guessedTitle)).trim();
+    if (!title) console.log(gray('  A title is required. Ctrl+C to quit.'));
+  }
+
+  const origTitle = (await promptText('Original title   (blank if same as above)', '')).trim();
+
+  let year = '';
+  while (true) {
+    const raw = (await promptText('Release year   (blank to skip)', guessedYear ? guessedYear.year : '')).trim();
+    if (!raw || /^(?:19|20)\d{2}$/.test(raw)) { year = raw; break; }
+    console.log(gray('  Enter a 4 digit year like 2020, or leave it blank.'));
+  }
+
+  const plot = (await promptText('Plot summary   (blank to skip)', '')).trim();
+  const genreRaw = (await promptText('Genres, comma separated   (blank to skip)', '')).trim();
+  const genres = genreRaw ? genreRaw.split(',').map((g) => g.trim()).filter(Boolean) : [];
+  const mpaa = (await promptText('Content rating, e.g. PG-13   (blank to skip)', '')).trim();
+
+  let imdbId = '';
+  while (true) {
+    const raw = (await promptText('IMDb ID, e.g. tt1234567   (blank to skip)', '')).trim();
+    if (!raw || /^tt\d{6,9}$/i.test(raw)) { imdbId = raw; break; }
+    console.log(gray('  An IMDb ID looks like tt1234567. Leave it blank to skip.'));
+  }
+  let tmdbId = '';
+  while (true) {
+    const raw = (await promptText('TMDb ID, numbers only   (blank to skip)', '')).trim();
+    if (!raw || /^\d+$/.test(raw)) { tmdbId = raw; break; }
+    console.log(gray('  A TMDb ID is numbers only, e.g. 27205. Leave it blank to skip.'));
+  }
+
+  const hideItems = [{
+    label: 'Hide File   ' + gray('(sets the OS hidden attribute so it stays out of the way)'),
+    checked: true,
+  }];
+  await checkboxList('movie.nfo options', hideItems);
+  const hide = hideItems[0].checked;
+
+  const lines = ['<movie>', '  <title>' + xmlEscape(title) + '</title>'];
+  if (origTitle) lines.push('  <originaltitle>' + xmlEscape(origTitle) + '</originaltitle>');
+  if (year) lines.push('  <year>' + year + '</year>');
+  if (plot) lines.push('  <plot>' + xmlEscape(plot) + '</plot>');
+  for (const g of genres) lines.push('  <genre>' + xmlEscape(g) + '</genre>');
+  if (mpaa) lines.push('  <mpaa>' + xmlEscape(mpaa) + '</mpaa>');
+  if (imdbId) lines.push('  <imdbid>' + xmlEscape(imdbId) + '</imdbid>');
+  if (tmdbId) lines.push('  <tmdbid>' + xmlEscape(tmdbId) + '</tmdbid>');
+  lines.push('</movie>');
+  const xml = lines.join('\n') + '\n';
+  const target = path.join(dir, 'movie.nfo');
+
+  clearScreen();
+  printHeader();
+  console.log('  ' + bold(brand('Create movie.nfo')) + '\n');
+  console.log('  ' + brand('Folder:   ') + dir + '   ' + gray('(name unchanged)'));
+  console.log('  ' + brand('File:     ') + target);
+  console.log('  ' + brand('Hidden:   ') + (hide ? 'yes' : 'no'));
+  console.log('');
+  console.log(gray(xml.replace(/^/gm, '    ').replace(/\s+$/, '')));
+  console.log('');
+  if (fs.existsSync(target)) {
+    console.log('  ' + yellow('A movie.nfo already exists here and will be replaced.'));
+    console.log('');
+  }
+
+  const ok = await selectMenu('Write this file?', ['Yes, write it', 'No, cancel']);
+  if (ok !== 0) {
+    console.log(yellow('\n  Cancelled. Nothing was written.'));
+    process.exit(0);
+  }
+
+  try {
+    fs.writeFileSync(target, xml);
+    console.log(green('\n  Wrote ' + target));
+    console.log('  ' + brand('Title: ') + title + (year ? '  (' + year + ')' : ''));
+  } catch (err) {
+    console.log(red('\n  Could not write the file: ' + err.message));
+    process.exit(1);
+  }
+
+  if (hide) {
+    if (process.platform === 'win32') {
+      try {
+        execFileSync('attrib', ['+h', target], { windowsHide: true });
+        console.log(gray('  Set as hidden. Turn on "show hidden items" in Explorer to see it.'));
+      } catch (err) {
+        console.log(yellow('  File written, but could not set the hidden attribute.'));
+      }
+    } else {
+      console.log(gray('  Hiding needs Windows. On this OS the file stays visible (it must'));
+      console.log(gray('  keep the name "movie.nfo" for Jellyfin, so it cannot be dot-hidden).'));
+    }
+  }
+
+  console.log(gray('  In Jellyfin, refresh metadata for this movie to pick up the changes.'));
+  process.exit(0);
+}
+
 // ---------------------------------------------------------------------------
 // Duplicate finder. Groups files that look like the same movie or episode,
 // shows resolution / date / size, and moves the ones you check into a
@@ -1515,7 +2129,7 @@ async function createSeasonNfo() {
 async function findDuplicates(config) {
   clearScreen();
   printHeader();
-  console.log('  ' + bold(brand('Find duplicates')) + '\n');
+  console.log('  ' + bold(brand('Find Duplicates')) + '\n');
   console.log('  ' + gray('Groups files that look like the same movie or episode. Nothing is'));
   console.log('  ' + gray('renamed or deleted. The ones you check are moved into a _Duplicates'));
   console.log('  ' + gray('folder at the scan root so you can look them over later.'));
@@ -1685,6 +2299,103 @@ async function findDuplicates(config) {
   process.exit(0);
 }
 
+// ---------------------------------------------------------------------------
+// Missing subtitles. Read only report: lists every video with no external
+// subtitle sitting next to it and, for .mkv, no subtitle track muxed inside
+// it either. Nothing is renamed, moved or deleted.
+// ---------------------------------------------------------------------------
+async function findMissingSubtitles(config) {
+  clearScreen();
+  printHeader();
+  console.log('  ' + bold(brand('Missing Subtitles')) + '\n');
+  console.log('  ' + gray('Lists every movie or episode with no subtitle: no external .srt/.ass/'));
+  console.log('  ' + gray('.vtt/etc. next to it, and for .mkv, no subtitle track muxed inside the'));
+  console.log('  ' + gray('file either. Nothing is changed, this is a read only report.'));
+  console.log('');
+
+  let scanPath = '';
+  while (!scanPath) {
+    const raw = (await promptText('Folder or drive path to scan', config.defaultPath || ''))
+      .replace(/^"(.*)"$/, '$1').trim();
+    let isDir = false;
+    try { isDir = !!raw && fs.statSync(raw).isDirectory(); } catch (err) { isDir = false; }
+    if (isDir) scanPath = raw;
+    else console.log(gray('  That folder does not exist. Check the path, or Ctrl+C to quit.'));
+  }
+
+  process.stdout.write(brand('  Scanning for video files ...'));
+  const videos = walk(scanPath, []);
+  process.stdout.write('\r' + gray(
+    `  Found ${videos.length} video file(s). Checking for subtitles ...            `
+  ) + '\n');
+
+  const missing = [];
+  const unknown = [];
+  for (const v of videos) {
+    if (hasExternalSubtitle(v)) continue;
+    if (path.extname(v).toLowerCase() === '.mkv') {
+      const tracks = probeMkvSubtitleTracks(v);
+      if (tracks === null) { unknown.push(v); continue; }
+      if (tracks.length) continue;
+    }
+    missing.push(v);
+  }
+
+  if (!missing.length && !unknown.length) {
+    console.log(green('\n  Every video has a subtitle, external or embedded.'));
+    process.exit(0);
+  }
+
+  missing.sort();
+  unknown.sort();
+  const relW = Math.max(24, COLS() - 4);
+  const items = missing.map((v) => ({
+    checked: false,
+    label: fit(path.relative(scanPath, v) || path.basename(v), relW),
+  }));
+  if (unknown.length) {
+    items.push({
+      checked: false,
+      label: gray(`--- ${unknown.length} .mkv file(s) could not be read, check these by hand ---`),
+    });
+    for (const v of unknown) {
+      items.push({ checked: false, label: gray(fit(path.relative(scanPath, v) || path.basename(v), relW)) });
+    }
+  }
+
+  await checkboxList(
+    `Missing subtitles   ${missing.length} file(s) with none found` +
+      (unknown.length ? `, ${unknown.length} unreadable` : '') +
+      '   (browse only, nothing to confirm)',
+    items
+  );
+
+  const save = await selectMenu('Save this list to a text file?', ['Yes', 'No']);
+  if (save === 0) {
+    const outPath = path.join(SCRIPT_DIR, 'missing-subtitles.txt');
+    const j = (v) => path.relative(scanPath, v) || path.basename(v);
+    const lines = [
+      'BOSSx - Jellyfin Formatter  v' + VERSION + '  missing subtitles report',
+      'Scanned:  ' + scanPath,
+      'When:     ' + new Date().toISOString(),
+      '',
+      '=== NO SUBTITLE FOUND (' + missing.length + ') ===',
+      ...missing.map(j),
+    ];
+    if (unknown.length) {
+      lines.push('', '=== COULD NOT READ (' + unknown.length + ') ===', ...unknown.map(j));
+    }
+    lines.push('');
+    try {
+      fs.writeFileSync(outPath, lines.join('\n'));
+      console.log(green('\n  Wrote ' + outPath));
+    } catch (err) {
+      console.log(red('\n  Could not write the file: ' + err.message));
+    }
+  }
+  process.exit(0);
+}
+
 // Printed by --version / --about. Works without an interactive terminal.
 function printAbout() {
   console.log(solidBlock(asciiArtTop, TOP_COLOR));
@@ -1694,8 +2405,8 @@ function printAbout() {
   ));
   console.log('');
   console.log('  BOSSx - Jellyfin Formatter   v' + VERSION);
-  console.log('  Rename to Jellyfin standards, folder stray files, find duplicates,');
-  console.log('  write custom season names, undo any run.');
+  console.log('  Rename movies, TV shows and subtitles to Jellyfin standards, folder');
+  console.log('  stray files, find duplicates and missing subtitles, undo any run.');
   console.log('');
   console.log('  ' + linkText('https://BOSSx.ca') + '     ' + linkText('https://discord.gg/G5wVgJFxQQ'));
 }
@@ -1835,7 +2546,7 @@ function printPlanSummary(mode, scanPath, opts) {
   printHeader();
   const modeLabel = {
     movies: 'Movies', tv: 'TV Shows', both: 'Movies + TV Shows',
-    setup: 'Put stray files in folders',
+    setup: 'Folderize Stray Files',
   }[mode];
   console.log('');
   console.log('  ' + brand('Mode:    ') + modeLabel);
@@ -1992,14 +2703,15 @@ async function undoFlow() {
   clearScreen();
   printHeader();
 
-  // A run can be reversed if it moved files: a rename run (RENAMED) or a
-  // "Find duplicates" run where copies were sent to a _Duplicates folder
-  // (MOVED). Files sent to the Recycle Bin or deleted are not reversible here.
+  // A run can be reversed if it moved files: a rename run (RENAMED), a
+  // "Find Duplicates" run where copies were sent to a _Duplicates folder
+  // (MOVED), or a "Rename Subtitles" run (also RENAMED, its own label just
+  // to say which kind of run it was). Files sent to the Recycle Bin or
+  // deleted are not reversible here.
   const UNDOABLE = new Set(['RENAMED', 'MOVED']);
+  const UNDOABLE_LABELS = new Set(['Run', 'Duplicates', 'Subtitles']);
   const runs = parseLog().filter(
-    (r) =>
-      (r.label === 'Run' || r.label === 'Duplicates') &&
-      r.entries.some((e) => UNDOABLE.has(e.status))
+    (r) => UNDOABLE_LABELS.has(r.label) && r.entries.some((e) => UNDOABLE.has(e.status))
   );
 
   if (!runs.length) {
@@ -2012,7 +2724,8 @@ async function undoFlow() {
   const ordered = runs.slice().reverse();
   const options = ordered.map((r) => {
     const n = r.entries.filter((e) => UNDOABLE.has(e.status)).length;
-    const tag = r.label === 'Duplicates' ? '   (duplicates move)' : '';
+    const tag = r.label === 'Duplicates' ? '   (duplicates move)' :
+      r.label === 'Subtitles' ? '   (subtitle rename)' : '';
     return `${r.ts}   ${n} file(s)${tag}`;
   });
   options.push('Cancel');
@@ -2080,12 +2793,24 @@ async function main() {
     await undoFlow();
     return;
   }
-  if (mode === 'nfo') {
+  if (mode === 'nfo-season') {
     await createSeasonNfo();
+    return;
+  }
+  if (mode === 'nfo-movie') {
+    await createMovieNfo();
     return;
   }
   if (mode === 'dupes') {
     await findDuplicates(config);
+    return;
+  }
+  if (mode === 'subs') {
+    await renameSubtitles(config);
+    return;
+  }
+  if (mode === 'missing-subs') {
+    await findMissingSubtitles(config);
     return;
   }
 
@@ -2308,7 +3033,49 @@ function selftest() {
   console.log((unified ? green('PASS') : red('FAIL')) + '  unifyShowFolders collapses lucifer/LUCIFER');
   if (!unified) console.log('      got : ' + batch.map((b) => b.relNew).join('  |  '));
 
-  const total = cases.length + skipCases.length + 1;
+  // Subtitle language/flag parsing, no files touched.
+  const subCases = [
+    ['Movie.Name.2020.English', { lang: 'en', rest: 'Movie Name 2020' }],
+    ['Movie.Name.2020.eng', { lang: 'en', rest: 'Movie Name 2020' }],
+    ['Movie.Name.2020.forced.en', { lang: 'en', rest: 'Movie Name 2020', forced: true }],
+    ['Show.S01E01.English.HI', { lang: 'en', rest: 'Show S01E01', sdh: true }],
+    ['Show.S01E01.en.default', { lang: 'en', rest: 'Show S01E01', default: true }],
+    ['Movie.2020.ptbr', { lang: 'pt-BR', rest: 'Movie 2020' }],
+    ['The.Matrix.1999.1080p.BluRay-GRP', { lang: null, rest: 'The Matrix 1999 1080p BluRay GRP' }],
+  ];
+  for (const [input, want] of subCases) {
+    const got = parseSubtitleSuffix(input);
+    const good = got.lang === want.lang && got.rest === want.rest &&
+      got.flags.forced === !!want.forced && got.flags.sdh === !!want.sdh &&
+      got.flags.default === !!want.default;
+    if (good) pass++;
+    console.log((good ? green('PASS') : red('FAIL')) + '  parseSubtitleSuffix: ' + input);
+    if (!good) console.log('      got : ' + JSON.stringify(got) + '\n      want: ' + JSON.stringify(want));
+  }
+
+  // pickMatchingVideo: choosing the right sibling video among several.
+  const matchCases = [
+    [['anything', 'anything', ['/L/Movie (2020)/Movie (2020) [BOSSx].mkv']],
+      '/L/Movie (2020)/Movie (2020) [BOSSx].mkv'],
+    [['Show.S01E02.English', 'Show S01E02',
+      ['/L/Show/Season 01/Show S01E01 [BOSSx].mkv', '/L/Show/Season 01/Show S01E02 [BOSSx].mkv']],
+      '/L/Show/Season 01/Show S01E02 [BOSSx].mkv'],
+    [['Rocky.1976.CD2.English', 'Rocky 1976 CD2',
+      ['/L/Rocky (1976)/Rocky (1976) - part1 [BOSSx].avi', '/L/Rocky (1976)/Rocky (1976) - part2 [BOSSx].avi']],
+      '/L/Rocky (1976)/Rocky (1976) - part2 [BOSSx].avi'],
+    [['Totally.Unrelated', 'Totally Unrelated',
+      ['/L/Show/Season 01/Show S01E01 [BOSSx].mkv', '/L/Show/Season 01/Show S01E02 [BOSSx].mkv']],
+      null],
+  ];
+  for (const [args, want] of matchCases) {
+    const got = pickMatchingVideo(...args);
+    const good = got === want;
+    if (good) pass++;
+    console.log((good ? green('PASS') : red('FAIL')) + '  pickMatchingVideo: ' + args[0]);
+    if (!good) console.log('      got : ' + got + '\n      want: ' + want);
+  }
+
+  const total = cases.length + skipCases.length + 1 + subCases.length + matchCases.length;
   console.log('');
   console.log((pass === total ? green : yellow)(`${pass} / ${total} passed`));
   process.exit(pass === total ? 0 : 1);
@@ -2325,6 +3092,8 @@ if (require.main !== module) {
   module.exports = {
     walk, buildRename, formatMovie, formatTV, stripJunk, loadConfig,
     parseLog, executeMoves, removeEmptyDirsUp, dedupKey,
+    walkAll, parseSubtitleSuffix, subtitleSuffixString, pickMatchingVideo,
+    buildSubtitleRename, hasExternalSubtitle, probeMkvSubtitleTracks,
   };
 } else if (process.argv.includes('--selftest')) {
   selftest();
